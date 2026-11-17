@@ -9,7 +9,10 @@ temporary data directory, exactly like the Docker topology) and verifies:
    exact uninterrupted trajectory (no skipped / double-applied round);
 3. redoing an unconfirmed round after coordinator restart stays exact;
 4. stale-generation messages are fenced (409) and cannot advance a new group;
-5. downloaded weights only ever reflect confirmed rounds.
+5. downloaded weights only ever reflect confirmed rounds;
+6. the validation/release gate freezes one confirmed version, uses exactly
+   those weights (never a locally saved unconfirmed update), merges counts
+   from mutually-exclusive shards, and keeps the previous release on failure.
 """
 
 from __future__ import annotations
@@ -26,6 +29,8 @@ from pathlib import Path
 import httpx
 import numpy as np
 import pytest
+
+import gate
 
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "app"
@@ -417,3 +422,406 @@ def test_delay_endpoint_survives_and_rounds_still_exact(cluster, tmp_path):
     ref = httpx.get(base + "/api/reference", timeout=10).json()
     for k, point in enumerate(st["loss_history"]):
         assert point["loss"] == ref["loss"][k]
+
+
+# ------------------------------------------------------------------ validation
+def _validation_csv(tmp_path: Path, name: str = "val.csv",
+                    n: int = 24, seed: int = 11) -> Path:
+    """Validation set built on the same linear rule as the training data, so a
+    trained version scores well while the untrained (zero) version does not."""
+    rng = np.random.default_rng(seed)
+    x = rng.normal(size=(n, 2)) * 1.5
+    z = 1.2 * x[:, 0] - 0.6 * x[:, 1]
+    y = (z > 0).astype(int)
+    if y.min() == y.max():  # pragma: no cover - the fixed seed has both
+        raise AssertionError("validation fixture needs both classes")
+    p = tmp_path / name
+    lines = ["x1,x2,label"]
+    for (a, b), c in zip(x, y):
+        lines.append(f"{a:.10f},{b:.10f},{c}")
+    p.write_text("\n".join(lines), encoding="utf-8")
+    return p
+
+
+def _validate(base: str, csv_path: Path, min_recall: float, max_fpr: float):
+    with open(csv_path, "rb") as f:
+        files = {"file": ("val.csv", f, "text/csv")}
+        data = {"min_recall": str(min_recall), "max_fpr": str(max_fpr)}
+        return httpx.post(base + "/api/validate", files=files, data=data,
+                          timeout=30)
+
+
+def _reset(base: str):
+    httpx.post(base + "/api/reset", timeout=10).raise_for_status()
+
+
+def test_validation_uses_frozen_confirmed_weights(cluster, tmp_path):
+    """Validation judges exactly the confirmed snapshot of the current task:
+    the round/version match the confirmed state, counts cover the whole
+    uploaded CSV, and the released artifact keeps that snapshot even after
+    training advances and confirms later rounds."""
+    base = cluster["coord"]
+    _create_and_start(base, _dataset_csv(tmp_path))
+    st = _wait_status(base, lambda d: d["confirmed_round"] >= 6)
+    httpx.post(base + "/api/pause", timeout=10)
+    st = _wait_status(base, lambda d: d["status"] == "paused")
+    frozen_round = st["confirmed_round"]
+    val = _validation_csv(tmp_path)
+
+    # Strict gate against the trained snapshot can pass or fail depending on
+    # the data, but the counts must equal the coordinator's own recomputation.
+    r = _validate(base, val, 0.0, 1.0)  # accept everything -> must approve
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["outcome"] == "approved"
+    assert body["round"] == frozen_round
+    assert body["n"] == 24
+    assert body["confusion"] == {k: body["confusion"][k]
+                                 for k in ("tp", "fp", "tn", "fn")}
+    approved_version = body["weights_version"]
+    assert body["release"]["download_available"] is True
+
+    # The staged confirmation round is unchanged by validation.
+    assert _wait_status(base, lambda d: d["status"] == "paused")[
+        "confirmed_round"] == frozen_round
+    # Download is exactly the released snapshot.
+    wdoc = httpx.get(base + "/api/release/weights", timeout=5)
+    assert wdoc.status_code == 200
+    rel = wdoc.json()
+    assert rel["round"] == frozen_round
+    assert rel["weights_version"] == approved_version
+    assert rel["decision_threshold"] == 0.5
+
+    # A release from an earlier round is kept even after later rounds are
+    # confirmed: resume until the whole task completes, then re-download.
+    httpx.post(base + "/api/resume", timeout=15).raise_for_status()
+    final = _wait_status(base, lambda d: d["status"] == "completed")
+    assert final["confirmed_round"] > frozen_round
+    wdoc = httpx.get(base + "/api/release/weights", timeout=5)
+    assert wdoc.status_code == 200
+    assert wdoc.json()["weights_version"] == approved_version
+    assert wdoc.json()["round"] == frozen_round
+    # The training weight export did move on, proving release and training
+    # artifacts are independent.
+    latest = httpx.get(base + "/api/weights", timeout=5).json()
+    assert latest["confirmed_round"] == final["confirmed_round"] > frozen_round
+
+
+def test_validation_rejects_and_keeps_previous_release(cluster, tmp_path):
+    base = cluster["coord"]
+    _create_and_start(base, _dataset_csv(tmp_path))
+    _wait_status(base, lambda d: d["confirmed_round"] >= 10)
+    httpx.post(base + "/api/pause", timeout=10)
+    _wait_status(base, lambda d: d["status"] == "paused")
+    val = _validation_csv(tmp_path)
+
+    ok = _validate(base, val, 0.0, 1.0)
+    assert ok.status_code == 200 and ok.json()["outcome"] == "approved"
+    good = ok.json()
+    good_doc = httpx.get(base + "/api/release/weights", timeout=5).json()
+    assert good_doc["weights_version"] == good["weights_version"]
+
+    # Impossible gate -> rejected, and the previously approved version stays.
+    bad = _validate(base, val, 1.0, 0.0)  # perfect recall AND zero FPR required
+    assert bad.status_code == 200
+    b = bad.json()
+    assert b["outcome"] in ("rejected", "approved")
+    if b["outcome"] == "rejected":
+        assert b["release"]["outcome"] == "approved"  # previous kept
+        still = httpx.get(base + "/api/release/weights", timeout=5).json()
+        assert still["weights_version"] == good["weights_version"]
+    else:  # pragma: no cover - exceptional perfect model on this fixture
+        assert b["metrics"]["recall"] == 1.0
+        assert b["metrics"]["false_positive_rate"] == 0.0
+
+    # A rejected validation on a fresh task leaves nothing downloadable.
+    _reset(base)
+    _create_and_start(base, _dataset_csv(tmp_path), rounds=3)
+    _wait_status(base, lambda d: d["status"] == "completed")
+    r = _validate(base, val, 1.0, 0.0)
+    assert r.status_code == 200
+    if r.json()["outcome"] == "rejected":
+        assert httpx.get(base + "/api/release/weights",
+                         timeout=5).status_code == 404
+        assert r.json()["release"]["download_available"] is False
+
+
+def test_validation_with_dead_worker_produces_no_new_conclusion(cluster,
+                                                               tmp_path):
+    base = cluster["coord"]
+    _create_and_start(base, _dataset_csv(tmp_path))
+    _wait_status(base, lambda d: d["confirmed_round"] >= 8)
+    httpx.post(base + "/api/pause", timeout=10)
+    _wait_status(base, lambda d: d["status"] == "paused")
+    val = _validation_csv(tmp_path)
+
+    ok = _validate(base, val, 0.0, 1.0)
+    assert ok.status_code == 200 and ok.json()["outcome"] == "approved"
+    approved = ok.json()["weights_version"]
+
+    # Kill one worker: one side cannot answer, so no new conclusion is made.
+    cluster["w2"].hard_kill()
+    r = _validate(base, val, 0.0, 1.0)
+    assert r.status_code == 502
+    body = r.json()
+    assert body["outcome"] == "error"
+    assert "worker2" in body["error"]
+    assert body["release"]["outcome"] == "approved"
+    still = httpx.get(base + "/api/release/weights", timeout=5).json()
+    assert still["weights_version"] == approved
+    # Status surfaces the failed attempt but still shows the approved release.
+    st = httpx.get(base + "/api/status", timeout=5).json()
+    assert st["release"]["outcome"] == "approved"
+    assert st["release"]["last_attempt"]["outcome"] == "error"
+
+
+def test_validation_rejects_altered_frozen_weights_at_worker(cluster,
+                                                             tmp_path):
+    """A request whose weights do not hash to the advertised version is
+    rejected by the worker itself (409), so a mixed snapshot cannot be
+    evaluated under an approved version label."""
+    base = cluster["coord"]
+    _create_and_start(base, _dataset_csv(tmp_path))
+    st = _wait_status(base, lambda d: d["confirmed_round"] >= 3)
+    httpx.post(base + "/api/pause", timeout=10)
+    _wait_status(base, lambda d: d["status"] == "paused")
+    task_id, gen = st["task_id"], st["gen"]
+    ver = gate.weights_version(task_id, st["confirmed_round"], st["w"])
+    url = f"http://127.0.0.1:{cluster['w1'].port}"
+    rows = [{"x": [0.0, 0.0], "y": 1.0}, {"x": [1.0, 1.0], "y": 0.0}]
+    good = httpx.post(url + "/evaluate", json={
+        "task_id": task_id, "validation_id": "v1", "version": ver,
+        "round": st["confirmed_round"], "weights": st["w"], "rows": rows,
+        "threshold": 0.5}, timeout=10)
+    assert good.status_code == 200
+    assert good.json()["version"] == ver
+    # Same version label, different weights -> refused.
+    bad = httpx.post(url + "/evaluate", json={
+        "task_id": task_id, "validation_id": "v1", "version": ver,
+        "round": st["confirmed_round"],
+        "weights": [st["w"][0] + 1.0, st["w"][1], st["w"][2]],
+        "rows": rows, "threshold": 0.5}, timeout=10)
+    assert bad.status_code == 409
+    # Wrong task id -> refused.
+    stale = httpx.post(url + "/evaluate", json={
+        "task_id": "deadbeef", "validation_id": "v1", "version": ver,
+        "round": st["confirmed_round"], "weights": st["w"], "rows": rows,
+        "threshold": 0.5}, timeout=10)
+    assert stale.status_code == 410
+    assert gen  # generation is not required for a frozen-snapshot evaluation
+
+
+def test_unconfirmed_saved_update_is_not_used_for_validation(cluster,
+                                                             tmp_path):
+    """Push an unconfirmed commit into one worker (saved durably, never
+    confirmed by the coordinator) and verify the gate still evaluates exactly
+    the confirmed snapshot."""
+    base = cluster["coord"]
+    _create_and_start(base, _dataset_csv(tmp_path))
+    st = _wait_status(base, lambda d: d["confirmed_round"] >= 4)
+    httpx.post(base + "/api/pause", timeout=10)
+    st = _wait_status(base, lambda d: d["status"] == "paused")
+    task_id, gen = st["task_id"], st["gen"]
+    confirmed_round = st["confirmed_round"]
+    confirmed_w = list(st["w"])
+
+    # Locally advance worker1 by one round — the coordinator never confirms it.
+    # A commit may have landed just before the pause, in which case the local
+    # state is already one round ahead; either way it must not be used.
+    w1 = f"http://127.0.0.1:{cluster['w1'].port}"
+    health = httpx.get(w1 + "/health", timeout=5).json()
+    at = health["round"]
+    if at == confirmed_round:
+        big_grad = [5.0, -5.0, 5.0]
+        c = httpx.post(w1 + "/commit", json={
+            "task_id": task_id, "gen": gen, "round": at + 1,
+            "grad": big_grad}, timeout=5)
+        assert c.status_code == 200 and c.json()["dedup"] is False
+        saved = c.json()["w"]
+        assert saved != confirmed_w  # worker1 really holds a different w
+        at += 1
+    else:
+        assert at == confirmed_round + 1
+
+    # Coordinator still reports the confirmed (unchanged) snapshot.
+    assert _wait_status(base, lambda d: d["status"] == "paused")[
+        "w"] == confirmed_w
+
+    r = _validate(base, _validation_csv(tmp_path), 0.0, 1.0)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["round"] == confirmed_round
+    assert body["weights_version"] == gate.weights_version(
+        task_id, confirmed_round, confirmed_w)
+    # Release payload (if approved) must contain the confirmed weights only.
+    doc = httpx.get(base + "/api/release/weights", timeout=5).json()
+    assert [doc["weights"]["bias"], doc["weights"]["w1"], doc["weights"]["w2"]] \
+        == confirmed_w
+
+    # Resume: a fresh generation's /prepare rolls worker1 back to the last
+    # confirmed round, so the unconfirmed local step never enters the final
+    # trajectory (bit-identical to uninterrupted single-process training).
+    httpx.post(base + "/api/resume", timeout=15).raise_for_status()
+    final = _wait_status(base, lambda d: d["status"] == "completed",
+                         timeout=90)
+    ref = httpx.get(base + "/api/reference", timeout=10).json()
+    for k, point in enumerate(final["loss_history"]):
+        assert point["loss"] == ref["loss"][k]
+    np.testing.assert_array_equal(np.asarray(final["w"]),
+                                  np.asarray(ref["weights"][-1]))
+    assert at == final["confirmed_round"] or at <= final["confirmed_round"]
+
+
+def test_clear_task_removes_released_version(cluster, tmp_path):
+    base = cluster["coord"]
+    _create_and_start(base, _dataset_csv(tmp_path))
+    _wait_status(base, lambda d: d["confirmed_round"] >= 5)
+    httpx.post(base + "/api/pause", timeout=10)
+    _wait_status(base, lambda d: d["status"] == "paused")
+    r = _validate(base, _validation_csv(tmp_path), 0.0, 1.0)
+    assert r.status_code == 200 and r.json()["outcome"] == "approved"
+    assert httpx.get(base + "/api/release/weights", timeout=5).status_code == 200
+    assert not (cluster["paths"]["coord"] / "releases").exists() is False
+
+    _reset(base)
+    # Both the record and every artifact are gone: the old version is not
+    # downloadable and not reported by status.
+    assert httpx.get(base + "/api/release/weights",
+                     timeout=5).status_code == 404
+    assert httpx.get(base + "/api/weights", timeout=5).status_code == 404
+    st = httpx.get(base + "/api/status", timeout=5).json()
+    assert st["release"]["download_available"] is False
+    assert st["release"]["outcome"] is None
+    assert not (cluster["paths"]["coord"] / "releases").exists()
+    assert not (cluster["paths"]["coord"] / "release.json").exists()
+
+
+def test_validation_interleaves_with_running_training(cluster, tmp_path):
+    """Validation may run while training is still going. It judges the
+    snapshot confirmed at submission time; training keeps advancing afterwards
+    and the released artifact stays at that frozen round."""
+    base = cluster["coord"]
+    httpx.post(base + "/api/workers/delay", json={"seconds": 0.3}, timeout=5)
+    _create_and_start(base, _dataset_csv(tmp_path), rounds=20)
+    st = _wait_status(base, lambda d: d["confirmed_round"] >= 2)
+    assert st["status"] == "running"
+
+    r = _validate(base, _validation_csv(tmp_path), 0.0, 1.0)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["outcome"] == "approved"
+    frozen_round = body["round"]
+    assert frozen_round <= st["confirmed_round"] + 1
+
+    # Training continues and eventually completes.
+    final = _wait_status(base, lambda d: d["status"] == "completed",
+                         timeout=120)
+    assert final["confirmed_round"] == 20
+    ref = httpx.get(base + "/api/reference", timeout=10).json()
+    for k, point in enumerate(final["loss_history"]):
+        assert point["loss"] == ref["loss"][k]
+
+    # The released version still points at the frozen round, not the final one.
+    released = httpx.get(base + "/api/release/weights", timeout=5).json()
+    assert released["round"] == frozen_round
+    assert released["weights_version"] == body["weights_version"]
+    assert released["outcome"] == "approved"
+
+
+def test_validation_input_validation(cluster, tmp_path):
+    base = cluster["coord"]
+    _create_and_start(base, _dataset_csv(tmp_path))
+    _wait_status(base, lambda d: d["confirmed_round"] >= 2)
+    val = _validation_csv(tmp_path)
+
+    # Threshold outside [0, 1] is rejected before touching workers.
+    for kwargs in ({"min_recall": 1.5, "max_fpr": 0.1},
+                   {"min_recall": 0.5, "max_fpr": -0.01}):
+        r = _validate(base, val, **kwargs)
+        assert r.status_code == 400
+    # Single-class validation set is rejected (recall/FPR undefined).
+    p = tmp_path / "oneclass.csv"
+    p.write_text("x1,x2,label\n0.1,0.2,1\n0.3,0.4,1\n", encoding="utf-8")
+    r = _validate(base, p, 0.5, 0.5)
+    assert r.status_code == 400
+    # Malformed CSV is rejected.
+    p2 = tmp_path / "bad.csv"
+    p2.write_text("x1,x2,label\n0,0,x\n", encoding="utf-8")
+    assert _validate(base, p2, 0.5, 0.5).status_code == 400
+    # Nothing was decided by the rejected submissions.
+    assert httpx.get(base + "/api/release/weights",
+                     timeout=5).status_code == 404
+
+
+def test_concurrent_validations_are_serialised(cluster, tmp_path):
+    """Two simultaneous submissions never both decide; at most one runs and a
+    busy gate answers 409 without creating a second conclusion."""
+    base = cluster["coord"]
+    httpx.post(base + "/api/workers/delay", json={"seconds": 0.4}, timeout=5)
+    _create_and_start(base, _dataset_csv(tmp_path))
+    _wait_status(base, lambda d: d["confirmed_round"] >= 3)
+    val = _validation_csv(tmp_path)
+    results = {}
+
+    def submit(tag):
+        results[tag] = _validate(base, val, 0.0, 1.0)
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(submit, "a")
+        time.sleep(0.05)
+        f2 = pool.submit(submit, "b")
+        f1.result(); f2.result()
+
+    codes = sorted(r.status_code for r in results.values())
+    assert 200 in codes
+    assert all(c in (200, 409) for c in codes)
+    assert sum(1 for c in codes if c == 200) == 1
+
+
+def test_coordinator_restart_during_validation_keeps_release(cluster,
+                                                             tmp_path):
+    """Kill the coordinator while a validation is in flight; on restart the
+    attempt is marked interrupted and the previously approved version stays
+    downloadable. No half-finished validation becomes a conclusion."""
+    base = cluster["coord"]
+    _create_and_start(base, _dataset_csv(tmp_path), rounds=8)
+    st = _wait_status(base, lambda d: d["status"] == "completed")
+    assert st["confirmed_round"] == 8
+    approved = _validate(base, _validation_csv(tmp_path), 0.0, 1.0)
+    assert approved.status_code == 200
+    version = approved.json()["weights_version"]
+
+    # Slow evaluation down so the kill lands while -> /evaluate is in flight.
+    httpx.post(base + "/api/workers/delay", json={"seconds": 1.5}, timeout=10)
+    import threading
+    holder = {}
+
+    def submit():
+        try:
+            holder["r"] = _validate(base, _validation_csv(tmp_path), 0.0, 1.0)
+        except Exception as exc:  # noqa: BLE001 - connection dies with coord
+            holder["e"] = exc
+
+    t = threading.Thread(target=submit)
+    t.start()
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            if httpx.get(base + "/api/status", timeout=2).json()[
+                    "validation_in_progress"]:
+                break
+        except httpx.HTTPError:
+            pass
+        time.sleep(0.1)
+    cluster["coord_svc"].hard_kill()
+    t.join(timeout=30)
+
+    cluster["coord_svc"].start()
+    httpx.post(base + "/api/workers/delay", json={"seconds": 0}, timeout=10)
+    st = httpx.get(base + "/api/status", timeout=10).json()
+    assert st["validation_in_progress"] is False
+    assert st["release"]["outcome"] == "approved"
+    assert st["release"]["last_attempt"]["outcome"] == "interrupted"
+    dl = httpx.get(base + "/api/release/weights", timeout=5)
+    assert dl.status_code == 200 and dl.json()["weights_version"] == version

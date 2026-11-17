@@ -15,6 +15,11 @@ Responsibilities
   previous training group can never advance a new group.
 * Keep a downloadable weight artifact that only ever reflects confirmed
   rounds; a failed save leaves the previous complete artifact in place.
+* Freeze one confirmed training version, evaluate it on an uploaded
+  validation CSV through both workers (mutually-exclusive samples, fixed
+  snapshot weights), merge confusion counts and decide whether that version
+  may go live. A failed/interrupted validation never replaces the previously
+  released version, and clearing the task removes access to it.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ import csv
 import io
 import json
 import os
+import shutil
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -31,11 +37,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+import gate
 import lrmath
+from release import ReleaseStore
 from storage import (atomic_write_json, exists,
                      if_exists_read_json, read_json)
 
@@ -45,6 +53,7 @@ STATUS_PATH = os.path.join(DATA_DIR, "status.json")
 WEIGHTS_DIR = os.path.join(DATA_DIR, "weights")
 LATEST_WEIGHTS = os.path.join(WEIGHTS_DIR, "weights_latest.json")
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+RELEASE = ReleaseStore(DATA_DIR)
 
 WORKERS = {
     "worker1": os.environ.get("WORKER1_URL", "http://worker1:8000"),
@@ -64,6 +73,8 @@ class Ctx:
         self.task: Optional[asyncio.Task] = None
         self.client: Optional[httpx.AsyncClient] = None
         self.worker_live: Dict[str, bool] = {k: False for k in WORKERS}
+        self.validation_lock: Optional[asyncio.Lock] = None
+        self.validation_in_progress: bool = False
 
 
 CTX = Ctx()
@@ -301,6 +312,11 @@ def ensure_not_busy() -> None:
         raise HTTPException(409, "a round is currently in progress")
 
 
+def ensure_not_validating() -> None:
+    if CTX.validation_in_progress:
+        raise HTTPException(409, "a validation is currently in progress")
+
+
 # ============================================================ API: schemas
 class DelayIn(BaseModel):
     seconds: float = Field(..., ge=0, le=120)
@@ -322,6 +338,10 @@ async def lifespan(app: FastAPI):
             "coordinator restarted while a round was in flight; "
             "unconfirmed round will be redone")
         save_status(CTX.status)
+    CTX.validation_lock = asyncio.Lock()
+    # A crash while a validation was in flight must not leave it looking
+    # unfinished forever; mark it interrupted (the conclusion is untouched).
+    RELEASE.mark_interrupted(now_ms())
     yield
     if CTX.task:
         CTX.task.cancel()
@@ -346,6 +366,9 @@ async def status() -> JSONResponse:
         out.update(CTX.status)
     out["worker_live"] = CTX.worker_live
     out["weights_available"] = exists(LATEST_WEIGHTS)
+    out["validation_in_progress"] = CTX.validation_in_progress
+    task_id = (CTX.job or {}).get("task_id")
+    out["release"] = RELEASE.summary(task_id)
     return JSONResponse(out)
 
 
@@ -354,6 +377,7 @@ async def create_job(file: UploadFile = File(...),
                      rounds: int = 10) -> JSONResponse:
     if not (1 <= rounds <= 100):
         raise HTTPException(400, "rounds must be in [1,100]")
+    ensure_not_validating()
     if CTX.status and CTX.status["status"] not in ("completed",):
         raise HTTPException(409, "a task already exists; reset it first")
     raw = await file.read()
@@ -478,14 +502,188 @@ async def pause() -> JSONResponse:
 @app.post("/api/reset")
 async def reset() -> JSONResponse:
     ensure_not_busy()
+    ensure_not_validating()
     for p in (JOB_PATH, STATUS_PATH):
         try:
             os.unlink(p)
         except FileNotFoundError:
             pass
+    # Clearing the task also removes the release record, every immutable
+    # released artifact and the per-round training exports: an old version must
+    # not stay downloadable afterwards.
+    RELEASE.clear()
+    shutil.rmtree(WEIGHTS_DIR, ignore_errors=True)
+    os.makedirs(WEIGHTS_DIR, exist_ok=True)
     CTX.job = None
     CTX.status = None
     return JSONResponse({"ok": True, "event": "task cleared"})
+
+
+def _threshold_or_400(value: float, name: str) -> float:
+    try:
+        return gate.normalize_threshold(value)
+    except gate.GateError as exc:
+        raise HTTPException(400, f"{name}: {exc}")
+
+
+@app.post("/api/validate")
+async def validate(file: UploadFile = File(...),
+                   min_recall: float = Form(...),
+                   max_fpr: float = Form(...)) -> JSONResponse:
+    """Freeze the current confirmed version and run the release gate.
+
+    * the task id and confirmed weights are snapshotted once, at submission;
+    * the validation CSV is split into mutually-exclusive shards, one per
+      worker, each evaluated with exactly the frozen weights;
+    * replies must match task/version/round/sample counts and are cross-checked
+      against the coordinator's own recomputation before counts are merged;
+    * an unreachable side, or any mismatch, records a failed attempt and does
+      not produce a new release conclusion (the previous release is kept).
+    """
+    min_recall = _threshold_or_400(min_recall, "min_recall")
+    max_fpr = _threshold_or_400(max_fpr, "max_fpr")
+    raw = await file.read()
+    x, y = parse_csv(raw)
+
+    # Serialise validations and claim the slot without an intervening await,
+    # so two concurrent submissions cannot both freeze/decide.
+    assert CTX.validation_lock is not None
+    if CTX.validation_lock.locked():
+        raise HTTPException(409, "a validation is currently in progress")
+    async with CTX.validation_lock:
+        CTX.validation_in_progress = True
+        try:
+            # Snapshot the task/round/weights only once, after the upload has
+            # been read: the frozen version is the latest confirmed one at the
+            # moment of submission and never changes during the run.
+            job, st = require_job()
+            return await _run_validation(job, st, x, y, min_recall, max_fpr)
+        finally:
+            CTX.validation_in_progress = False
+
+
+async def _run_validation(job: Dict[str, Any], st: Dict[str, Any],
+                          x: np.ndarray, y: np.ndarray,
+                          min_recall: float, max_fpr: float) -> JSONResponse:
+    """Body of :func:`validate`, executed while holding the validation lock."""
+    # ---- freeze the version exactly once
+    task_id = str(job["task_id"])
+    round_ = int(st["confirmed_round"])
+    weights = gate.normalize_weights(st["w"])
+    version = gate.weights_version(task_id, round_, weights)
+    validation_id = uuid.uuid4().hex
+    n = len(y)
+    idx1, idx2 = split_indices(n)
+    rows_all = [{"x": [float(x[i, 0]), float(x[i, 1])], "y": float(y[i])}
+                for i in range(n)]
+    per_worker = {"worker1": idx1, "worker2": idx2}
+
+    # Coordinator-side expectation: recompute counts over the full validation
+    # set from the frozen weights. This is what worker replies must equal.
+    expected_full = gate.confusion_counts(lrmath.augment(x), y, weights,
+                                          gate.DECISION_THRESHOLD)
+    expected_parts = {}
+    for wid, idx in per_worker.items():
+        if not idx:
+            raise HTTPException(400, "validation set too small to split")
+        expected_parts[wid] = gate.confusion_counts(
+            lrmath.augment(x[idx]), y[idx], weights, gate.DECISION_THRESHOLD)
+
+    doc = RELEASE.load()
+    if doc is None or doc.get("task_id") != task_id:
+        doc = RELEASE.new_doc(task_id, now_ms())
+    attempt = {
+        "validation_id": validation_id,
+        "task_id": task_id,
+        "round": round_,
+        "weights_version": version,
+        "n": n,
+        "min_recall": min_recall,
+        "max_fpr": max_fpr,
+        "decision_threshold": gate.DECISION_THRESHOLD,
+        "started_at": now_ms(),
+    }
+    doc = RELEASE.record_attempt(doc, attempt, now_ms())
+    RELEASE.save(doc)
+
+    payloads = {
+        wid: {"task_id": task_id, "validation_id": validation_id,
+              "version": version, "round": round_,
+              "weights": weights,
+              "rows": [rows_all[i] for i in idx],
+              "threshold": gate.DECISION_THRESHOLD}
+        for wid, idx in per_worker.items()
+    }
+    replies = await asyncio.gather(*(
+        worker_call(wid, "/evaluate", payloads[wid], tolerate=True)
+        for wid in WORKERS))
+
+    error: Optional[str] = None
+    counts: Optional[Dict[str, int]] = None
+    try:
+        # A task switch or reset while replies were in flight means the
+        # frozen snapshot no longer describes the current task.
+        if CTX.job is None or str(CTX.job.get("task_id")) != task_id:
+            raise gate.GateError("task changed during validation")
+        parts = []
+        for wid, reply in zip(WORKERS, replies):
+            parts.append(gate.verify_shard_response(
+                reply, task_id=task_id, validation_id=validation_id,
+                version=version, worker_id=wid, round_=round_,
+                expected_n=len(per_worker[wid]),
+                expected_counts=expected_parts[wid]))
+        merged = gate.merge_counts(parts)
+        if merged != expected_full:
+            raise gate.GateError(
+                "merged shard counts differ from the full-set recomputation")
+        counts = merged
+    except gate.GateError as exc:
+        error = str(exc)
+
+    if error is not None:
+        attempt.update({"outcome": "error", "error": error,
+                        "finished_at": now_ms()})
+        doc = RELEASE.load() or doc
+        doc = RELEASE.update_attempt(doc, validation_id, attempt, now_ms())
+        RELEASE.save(doc)
+        return JSONResponse(
+            {"outcome": "error", "error": error,
+             "validation_id": validation_id,
+             "weights_version": version,
+             "release": RELEASE.summary(task_id)},
+            status_code=502)
+
+    assert counts is not None
+    verdict = gate.decide(counts, min_recall, max_fpr)
+    attempt.update({
+        "outcome": "approved" if verdict["passed"] else "rejected",
+        "confusion": counts, "metrics": verdict["metrics"],
+        "reason": verdict["reason"], "finished_at": now_ms()})
+    doc = RELEASE.load() or doc
+    doc = RELEASE.update_attempt(doc, validation_id, attempt, now_ms())
+    if verdict["passed"]:
+        doc = RELEASE.publish(
+            doc, task_id=task_id, round_=round_, weights=weights,
+            thresholds={"min_recall": min_recall, "max_fpr": max_fpr},
+            confusion=counts, metrics=verdict["metrics"],
+            reason=verdict["reason"], validation_id=validation_id,
+            n=n, threshold=gate.DECISION_THRESHOLD, now_ms=now_ms())
+    else:
+        # Rejection never replaces a previously approved version.
+        RELEASE.save(doc)
+    return JSONResponse({
+        "outcome": attempt["outcome"],
+        "validation_id": validation_id,
+        "weights_version": version,
+        "round": round_,
+        "n": n,
+        "decision_threshold": gate.DECISION_THRESHOLD,
+        "confusion": counts,
+        "metrics": verdict["metrics"],
+        "thresholds": {"min_recall": min_recall, "max_fpr": max_fpr},
+        "reason": verdict["reason"],
+        "release": RELEASE.summary(task_id),
+    })
 
 
 @app.post("/api/workers/{worker_id}/delay")
@@ -529,6 +727,25 @@ async def download_weights() -> FileResponse:
     return FileResponse(
         LATEST_WEIGHTS, media_type="application/json",
         filename=f"weights_round_{doc['confirmed_round']:04d}.json")
+
+
+@app.get("/api/release/weights")
+async def download_release() -> FileResponse:
+    """Download the released weights of the *current* task, if approved."""
+    job, _ = require_job()
+    found = RELEASE.approved_artifact(str(job["task_id"]))
+    if not found:
+        raise HTTPException(404, "no approved release for the current task")
+    record = found["record"]
+    payload = found["payload"]
+    headers = {
+        "X-Release-Round": str(int(record["round"])),
+        "X-Weights-Version": str(record["weights_version"]),
+        "X-Release-Decision-Threshold": str(payload["decision_threshold"]),
+    }
+    return FileResponse(
+        found["path"], media_type="application/json", headers=headers,
+        filename=f"release_round_{int(record['round']):04d}.json")
 
 
 @app.get("/api/reference")

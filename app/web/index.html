@@ -99,7 +99,42 @@
     </div>
 
     <div class="card" style="margin-top:18px">
-      <h2>3 · 故障注入</h2>
+      <h2>3 · 验证与放行（固定当前版本）</h2>
+      <label>验证 CSV（列：x1, x2, label∈{0,1}；正负样本均需存在）</label>
+      <input type="file" id="valCsv" accept=".csv,text/csv">
+      <div class="grid2">
+        <div>
+          <label>最低召回率（0～1）</label>
+          <input type="number" id="minRecall" value="0.80" min="0" max="1"
+                 step="0.01">
+        </div>
+        <div>
+          <label>最高误报率（0～1）</label>
+          <input type="number" id="maxFpr" value="0.10" min="0" max="1"
+                 step="0.01">
+        </div>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button id="btnValidate">提交验证并判定放行</button>
+        <button class="ghost" id="btnRelease" disabled>下载已放行版本权重</button>
+      </div>
+      <div class="hint">提交时冻结当前已确认权重（含轮次与任务）并分发给两个
+        worker，互斥样本各自评估后合并混淆计数。评估只用冻结权重，worker 本地
+        已保存但未确认的更新不会被使用。分类阈值固定为 0.5。</div>
+      <div class="err" id="valErr"></div>
+      <div class="kv" style="margin-top:10px">
+        <div class="k">放行状态</div><div id="relState">—</div>
+        <div class="k">已放行版本</div><div id="relVersion">—</div>
+        <div class="k">冻结轮次</div><div id="relRound">—</div>
+        <div class="k">合并混淆计数</div><div id="relCounts">—</div>
+        <div class="k">召回率 / 误报率</div><div id="relMetrics">—</div>
+        <div class="k">门槛</div><div id="relThresholds">—</div>
+        <div class="k">结论说明</div><div id="relReason">—</div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:18px">
+      <h2>4 · 故障注入</h2>
       <label>人工延迟（秒，注入到每个进程的梯度/提交/准备响应）</label>
       <div class="row">
         <input type="number" id="delay" value="0" min="0" max="120" step="0.5"
@@ -261,6 +296,40 @@ function render(d) {
   }
   const busy = st === "running" || st === "preparing";
   ["btnStart","btnResume"].forEach(b=>$(b).disabled = busy);
+  const validating = !!d.validation_in_progress;
+  $("btnValidate").disabled = busy || validating || !d.task_id;
+  $("btnValidate").textContent = validating ? "验证进行中…" : "提交验证并判定放行";
+  renderRelease(d.release, validating);
+}
+
+function renderRelease(rel, validating) {
+  rel = rel || {};
+  const out = rel.outcome;
+  const pill = out === "approved"
+    ? `<span class="pill completed">已放行</span>`
+    : out === "rejected"
+      ? `<span class="pill paused">已拒绝</span>`
+      : `<span class="pill idle">未放行</span>`;
+  $("relState").innerHTML = validating ? "验证进行中…" : pill;
+  $("relVersion").textContent = rel.version || "—";
+  $("relRound").textContent = rel.round ?? "—";
+  const c = rel.confusion;
+  $("relCounts").textContent = c
+    ? `TP=${c.tp} FP=${c.fp} TN=${c.tn} FN=${c.fn}` : "—";
+  const m = rel.metrics;
+  $("relMetrics").textContent = m
+    ? `召回率 ${fmt(m.recall,4)} · 误报率 ${fmt(m.false_positive_rate,4)} · 准确率 ${fmt(m.accuracy,4)}`
+    : "—";
+  const t = rel.thresholds;
+  $("relThresholds").textContent = t
+    ? `最低召回率 ${fmt(t.min_recall,4)} · 最高误报率 ${fmt(t.max_fpr,4)}`
+    : "—";
+  const a = rel.last_attempt;
+  const outcomeText = {approved:"放行", rejected:"拒绝", error:"无结论（中断/不匹配）"};
+  $("relReason").textContent = a
+    ? `${outcomeText[a.outcome]||a.outcome||"—"}${a.reason?(" · "+a.reason):""}${a.error?(" · "+a.error):""}`
+    : (rel.reason || "—");
+  $("btnRelease").disabled = !rel.download_available;
 }
 
 function pushLog(line) {
@@ -287,6 +356,32 @@ $("btnReset").onclick = async()=>{
   try{ await post("/api/reset"); location.reload(); }
   catch(e){ pushLog("重置失败: "+e.message); } };
 $("btnWeights").onclick = ()=>{ window.location = "/api/weights"; };
+$("btnRelease").onclick = ()=>{ window.location = "/api/release/weights"; };
+$("btnValidate").onclick = async()=>{
+  const f = $("valCsv").files[0];
+  if (!f) { $("valErr").textContent = "请先选择验证 CSV 文件"; return; }
+  const minR = parseFloat($("minRecall").value);
+  const maxF = parseFloat($("maxFpr").value);
+  if (!(minR>=0 && minR<=1)) { $("valErr").textContent = "最低召回率必须在 0～1"; return; }
+  if (!(maxF>=0 && maxF<=1)) { $("valErr").textContent = "最高误报率必须在 0～1"; return; }
+  const fd = new FormData();
+  fd.append("file", f);
+  fd.append("min_recall", String(minR));
+  fd.append("max_fpr", String(maxF));
+  try {
+    $("valErr").textContent = "验证中…";
+    const r = await fetch("/api/validate", {method:"POST", body:fd});
+    const data = await r.json().catch(()=>({detail:"无效响应"}));
+    if (!r.ok) {
+      $("valErr").textContent = "未产生结论：" + (data.error || data.detail || r.status);
+    } else {
+      $("valErr").textContent = "";
+      pushLog(`验证结论：${data.outcome} · 召回率 ${fmt(data.metrics.recall,4)}`+
+              ` · 误报率 ${fmt(data.metrics.false_positive_rate,4)}`);
+    }
+  } catch(e) { $("valErr").textContent = "验证失败：" + e.message; }
+  poll();
+};
 $("btnDelay").onclick = async()=>{
   const s = parseFloat($("delay").value)||0;
   try{ await post("/api/workers/delay", {seconds:s});

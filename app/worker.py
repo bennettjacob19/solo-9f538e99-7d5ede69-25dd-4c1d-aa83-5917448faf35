@@ -6,6 +6,14 @@ mounted at ``WORKER_DATA`` (default ``/data``). Durable files:
 * ``shard.json``  - the exclusive sample shard assigned to this worker
 * ``state.json``  - highest persisted ``{round, weights, momentum}``
 
+Validation evaluation
+---------------------
+``/evaluate`` classifies a validation shard with **exactly the weights supplied
+in the request**. It never reads this worker's local training buffers, so an
+unconfirmed update that was already durably saved locally cannot leak into a
+release decision. The worker echoes task id, validation id, frozen version,
+round and sample count so the coordinator can reject any mixed/stale reply.
+
 Fencing
 -------
 Every round-protocol message carries ``task_id`` + ``gen`` (training-group
@@ -35,6 +43,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 import lrmath
+import gate
 from storage import atomic_write_json, if_exists_read_json
 
 WORKER_ID = os.environ.get("WORKER_ID", "worker")
@@ -192,6 +201,41 @@ class WorkerState:
                 "w": lrmath.to_list(self.w),
                 "v": lrmath.to_list(self.v), "dedup": False}
 
+    def evaluate(self, task_id: str, validation_id: str, version: str,
+                 round_: int, weights: list, rows: list,
+                 threshold: float) -> Dict[str, Any]:
+        """Classify validation rows using ONLY the frozen request weights.
+
+        Deliberately not generation-fenced: validation is a read-only
+        evaluation of one confirmed snapshot and may run while training is
+        paused, completed, or (in a newer generation) still going. The task id
+        and the frozen version are still checked, so a stale task or altered
+        weights cannot be evaluated as if they were the frozen model.
+        """
+        if self.task_id is None:
+            raise HTTPException(status_code=410,
+                                detail="worker holds no task shard")
+        if task_id != self.task_id:
+            raise HTTPException(status_code=410,
+                                detail="task id mismatch (stale task)")
+        try:
+            expected = gate.weights_version(task_id, round_, weights)
+            if version != expected:
+                raise HTTPException(
+                    status_code=409,
+                    detail="frozen weights version mismatch")
+            xs = np.asarray([r["x"] for r in rows], dtype=np.float64)
+            ys = np.asarray([r["y"] for r in rows], dtype=np.float64)
+            counts = gate.confusion_counts(
+                lrmath.augment(xs), ys, weights, threshold)
+        except gate.GateError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {
+            "worker_id": WORKER_ID, "task_id": task_id,
+            "validation_id": validation_id, "version": expected,
+            "round": int(round_), "n": int(len(rows)), "counts": counts,
+        }
+
 
 STATE = WorkerState()
 
@@ -222,6 +266,16 @@ class CommitIn(BaseModel):
     gen: int
     round: int
     grad: list
+
+
+class EvaluateIn(BaseModel):
+    task_id: str
+    validation_id: str
+    version: str
+    round: int
+    weights: list
+    rows: list = Field(..., min_length=1)
+    threshold: float = gate.DECISION_THRESHOLD
 
 
 class DelayIn(BaseModel):
@@ -264,6 +318,13 @@ async def gradient(body: GradIn) -> Dict[str, Any]:
 async def commit(body: CommitIn) -> Dict[str, Any]:
     await STATE.inject_delay()
     return STATE.commit(body.task_id, body.gen, body.round, body.grad)
+
+
+@app.post("/evaluate")
+async def evaluate(body: EvaluateIn) -> Dict[str, Any]:
+    await STATE.inject_delay()
+    return STATE.evaluate(body.task_id, body.validation_id, body.version,
+                          body.round, body.weights, body.rows, body.threshold)
 
 
 @app.post("/delay")
